@@ -38,6 +38,40 @@ function load_inputs {
   fi
 
   if [ -z "$AZDO_PAT" ]; then
+    # If on PAAS, ask to use az cli credentials instead of an actual PAT
+    if [ "$INSTALL_TYPE" == "PAAS" ]; then
+
+      local use_az_cli_credentials_azdo=""
+      _select_yes_no use_az_cli_credentials_azdo "Use Azure CLI credentials for Azure DevOps" "true"
+
+      if [ "$use_az_cli_credentials_azdo" == "yes" ]; then
+        _information "Retrieving a short lived access token for AzDO..."
+
+        # If AZDO_TENANT_ID is set, use it
+        if [ -n "$AZDO_TENANT_ID" ]; then
+          tenant_id=$AZDO_TENANT_ID
+        else
+          # Try to get the managedByTenantId first
+          local tenant_id=$(az account show --query managedByTenants[0].tenantId -o tsv)
+
+          # If that is empty, fallback to the tenantId
+          if [ -z "$tenant_id" ]; then
+              tenant_id=$(az account show --query tenantId -o tsv)
+          fi
+        fi
+
+        _information "Using tenant_id: $tenant_id"
+
+        local azdo_resource_id="499b84ac-1321-427f-aa17-267ca6975798"
+
+        AZDO_PAT=$(az account get-access-token --tenant $tenant_id --resource $azdo_resource_id --query accessToken --output tsv)
+
+        _information "Retrieved an access token for AzDO via az cli!"
+      fi
+    fi
+  fi
+
+  if [ -z "$AZDO_PAT" ]; then
     _prompt_input "Enter Azure Devops PAT" AZDO_PAT
   fi
 }
@@ -47,7 +81,7 @@ function configure_repo {
 
   local project_source_control='git'
   local project_process_tempalte='Agile'
-  local _token=$(echo -n ":${AZDO_PAT}" | base64)
+  local _token=$(echo -n ":${AZDO_PAT}" | base64 -w 0)
 
   _information "Starting project creation for project ${AZDO_PROJECT_NAME}"
 
@@ -133,27 +167,163 @@ function configure_repo {
   _success "Project '${AZDO_PROJECT_NAME}' created."
 }
 
+function configure_runners {
+  # Replace in all files in ./.azure-pipelines "runs-on: ubuntu-latest" with "runs-on: self-hosted"
+  if [[ "$OSTYPE" == "darwin"* ]]; then
+      for file in ./.azure-pipelines/*; do
+          sed -i '' -E 's/([[:space:]]*)vmImage: \$\(agentImage\)([[:space:]]*)/\1name: 'Default'\2/g' "$file"
+      done
+  else
+      for file in ./.azure-pipelines/*; do
+          sed -i -E 's/([[:space:]]*)vmImage: \$\(agentImage\)([[:space:]]*)/\1name: 'Default'\2/g' "$file"
+      done
+  fi
+
+  # Verify that required variables exist
+  local REQUIRED_VARS=(\
+      AZDO_ORG_URI \
+      AZDO_PAT \
+      RUNNERS_RESOURCE_GROUP \
+      RUNNERS_LOCATION \
+      RUNNERS_SUBNET \
+      RUNNERS_PUBLIC_KEY_PATH)
+  for var in "${REQUIRED_VARS[@]}"; do
+      if [[ -z "${!var}" ]]; then
+          _error "The variable '$var' is not defined. Aborting."
+          exit 1
+      fi
+  done
+
+  # Validate that the file exists
+  if [[ ! -f "$RUNNERS_PUBLIC_KEY_PATH" ]]; then
+      _error "The specified public key file '$RUNNERS_PUBLIC_KEY_PATH' does not exist. Aborting."
+      exit 1
+  fi
+
+  # Optional parameter: VM size (default: Standard_D2s_v3)
+  RUNNERS_AZURE_VM_SIZE=${RUNNERS_AZURE_VM_SIZE:-Standard_D2s_v3}
+
+  # Optional parameter: Number of runners to launch (default: 1)
+  RUNNERS_COUNT=${RUNNERS_COUNT:-1}
+
+  # Optional parameter: Image (default: Ubuntu2404)
+  RUNNERS_AZURE_IMAGE=${RUNNERS_AZURE_IMAGE:-Ubuntu2404}
+
+  # Optional parameter: VM name (default: symphony-azdo-runner)
+  RUNNERS_VM_NAME=${RUNNERS_VM_NAME:-symphony-azdo-runner}-${AZDO_PROJECT_NAME}
+
+  # Optional parameter: VM username (default: azureuser)
+  RUNNERS_VM_USERNAME=${RUNNERS_VM_USERNAME:-azureuser}
+
+  local token=$AZDO_PAT
+
+  # Generate the cloud-init file (cloud-init.yaml)
+  cat > cloud-init.yaml <<EOF
+  #cloud-config
+  package_update: true
+
+  packages:
+    - curl
+    - tar
+    - uidmap
+    - unzip
+    - docker.io
+    - build-essential
+
+  write_files:
+    - path: /agent-install.sh
+      permissions: '0777'
+      content: |
+          #!/usr/bin/env bash
+
+          cd /home/$RUNNERS_VM_USERNAME
+
+          # Enable Docker
+          sudo systemctl enable --now docker
+          sudo usermod -aG docker $RUNNERS_VM_USERNAME
+
+          # Install AzDO runner
+
+          for i in \$(seq 1 ${RUNNERS_COUNT}); do
+              RUNNER_DIR="/home/$RUNNERS_VM_USERNAME/azdo-runner-\$i"
+              echo "Configuring runner in \$RUNNER_DIR..."
+              mkdir -p "\$RUNNER_DIR"
+              cd "\$RUNNER_DIR"
+
+              # Download a fixed version of the runner
+              RUNNER_VERSION="4.251.0"
+              curl -O -L "https://vstsagentpackage.azureedge.net/agent/\${RUNNER_VERSION}/vsts-agent-linux-x64-\${RUNNER_VERSION}.tar.gz"
+              tar xzf "vsts-agent-linux-x64-\${RUNNER_VERSION}.tar.gz"
+
+              # Configure the runner non-interactively using its respective token
+              ./config.sh --unattended --url "${AZDO_ORG_URI}" --auth pat --token "${token}" --pool "Default" --agent "agent-\$i" --acceptTeeEula
+
+              # Install the service
+              sudo ./svc.sh install
+
+              # Start the runner in the background
+              sudo ./svc.sh start
+
+              # Return to the home directory for the next iteration
+              cd /home/$RUNNERS_VM_USERNAME
+          done
+  runcmd:
+    - sudo -u $RUNNERS_VM_USERNAME /agent-install.sh
+EOF
+
+  echo "cloud-init.yaml file generated."
+
+  # Create the VM using Azure CLI with the specified parameters and cloud-init
+  _information "Creating the VM in Azure..."
+  vm_create_command="az vm create \
+    --resource-group \"$RUNNERS_RESOURCE_GROUP\" \
+    --name \"$RUNNERS_VM_NAME\" \
+    --location \"$RUNNERS_LOCATION\" \
+    --image \"$RUNNERS_AZURE_IMAGE\" \
+    --size \"$RUNNERS_AZURE_VM_SIZE\" \
+    --admin-username \"$RUNNERS_VM_USERNAME\" \
+    --ssh-key-values \"@$RUNNERS_PUBLIC_KEY_PATH\" \
+    --subnet \"$RUNNERS_AZURE_SUBNET\" \
+    --nsg \"\" \
+    --custom-data cloud-init.yaml"
+
+  _debug "Running command: $vm_create_command"
+  eval $vm_create_command
+
+  rm cloud-init.yaml
+
+  _information "The VM creation request has been submitted."
+}
+
 function configure_credentials {
   _information "Configure Service Connections"
   _create_arm_svc_connection
 }
 
 function create_pipelines_terraform() {
+  _information "Creating variable group for Terraform pipelines"
+
+  local variablesInGroup
+
+  variablesInGroup=$(_get_pipeline_var_defintion stateRg $SYMPHONY_RG_NAME true)
+  variablesInGroup="$variablesInGroup, $(_get_pipeline_var_defintion stateStorageAccount $SYMPHONY_SA_STATE_NAME true)"
+  variablesInGroup="$variablesInGroup, $(_get_pipeline_var_defintion stateContainer $SYMPHONY_STATE_CONTAINER true)"
+  variablesInGroup="$variablesInGroup, $(_get_pipeline_var_defintion stateStorageAccountBackup $SYMPHONY_SA_STATE_NAME_BACKUP true)"
+
+  _create_variable_group "symphony" "${variablesInGroup}"
+
   _information "Creating Azure Pipelines "
   local pipelineVariables
 
   pipelineVariables=$(_get_pipeline_var_defintion environmentName dev true)
-  pipelineVariables="$pipelineVariables, $(_get_pipeline_var_defintion keyVaultArmSvcConnectionName Symphony-KV true)"
-  pipelineVariables="$pipelineVariables, $(_get_pipeline_var_defintion keyVaultName ${SYMPHONY_KV_NAME} true)"
+
   pipelineVariables="$pipelineVariables, $(_get_pipeline_var_defintion goVersion 1.18.1 true)"
-  pipelineVariables="$pipelineVariables, $(_get_pipeline_var_defintion terraformVersion 1.6.2 true)"
+  pipelineVariables="$pipelineVariables, $(_get_pipeline_var_defintion terraformVersion 1.11.0 true)"
   pipelineVariables="$pipelineVariables, $(_get_pipeline_var_defintion runLayerTest false true)"
   pipelineVariables="$pipelineVariables, $(_get_pipeline_var_defintion runBackupState true true)"
   _create_pipeline "CI-Deploy" "/.azure-pipelines/pipeline.ci.terraform.yml" "Deploy" "${pipelineVariables}" "${AZDO_PROJECT_NAME}"
 
   pipelineVariables=$(_get_pipeline_var_defintion environmentName dev true)
-  pipelineVariables="$pipelineVariables, $(_get_pipeline_var_defintion keyVaultArmSvcConnectionName Symphony-KV true)"
-  pipelineVariables="$pipelineVariables, $(_get_pipeline_var_defintion keyVaultName ${SYMPHONY_KV_NAME} true)"
   _create_pipeline "Destroy" "/.azure-pipelines/pipeline.destroy.terraform.yml" "Destroy" "${pipelineVariables}" "${AZDO_PROJECT_NAME}"
 
 }
@@ -164,15 +334,11 @@ function create_pipelines_bicep() {
 
   pipelineVariables=$(_get_pipeline_var_defintion environmentName dev true)
   pipelineVariables="$pipelineVariables, $(_get_pipeline_var_defintion locationName westus true)"
-  pipelineVariables="$pipelineVariables, $(_get_pipeline_var_defintion keyVaultArmSvcConnectionName Symphony-KV true)"
-  pipelineVariables="$pipelineVariables, $(_get_pipeline_var_defintion keyVaultName ${SYMPHONY_KV_NAME} true)"
   pipelineVariables="$pipelineVariables, $(_get_pipeline_var_defintion excludedFolders , true)"
   _create_pipeline "CI-Deploy" "/.azure-pipelines/pipeline.ci.bicep.yml" "Deploy" "${pipelineVariables}" "${AZDO_PROJECT_NAME}"
 
   pipelineVariables=$(_get_pipeline_var_defintion environmentName dev true)
   pipelineVariables="$pipelineVariables, $(_get_pipeline_var_defintion locationName westus true)"
-  pipelineVariables="$pipelineVariables, $(_get_pipeline_var_defintion keyVaultArmSvcConnectionName Symphony-KV true)"
-  pipelineVariables="$pipelineVariables, $(_get_pipeline_var_defintion keyVaultName ${SYMPHONY_KV_NAME} true)"
   _create_pipeline "Destroy" "/.azure-pipelines/pipeline.destroy.bicep.yml" "Destroy" "${pipelineVariables}" "${AZDO_PROJECT_NAME}"
 
 }
@@ -191,7 +357,7 @@ function _create_arm_svc_connection() {
   _payload=$(_create_svc_connection_payload)
   echo "${_payload}" >"$AZDO_TEMP_LOG_PATH/casc_payload.json"
 
-  local _token=$(echo -n ":${AZDO_PAT}" | base64)
+  local _token=$(echo -n ":${AZDO_PAT}" | base64 -w 0)
   _response=$(
     request_post \
       "${_uri}" \
@@ -204,6 +370,25 @@ function _create_arm_svc_connection() {
   _debug_log_post "$_uri" "$_response" "$_payload"
 
   sc_id=$(jq <"$AZDO_TEMP_LOG_PATH/casc.json" -r .id)
+  sc_issuer=$(jq <"$AZDO_TEMP_LOG_PATH/casc.json" -r '.authorization.parameters.workloadIdentityFederationIssuer')
+  sc_subject=$(jq <"$AZDO_TEMP_LOG_PATH/casc.json" -r '.authorization.parameters.workloadIdentityFederationSubject')
+
+
+  # Configuring federated identity for Azure DevOps Pipelines, based on repo name and environment name
+  parameters=$(cat <<EOF
+  {
+    "name": "symphony-credential-${AZDO_PROJECT_ID}",
+    "issuer": "${sc_issuer}",
+    "subject": "${sc_subject}",
+    "description": "Symphony credential for Azure DevOps Pipelines",
+    "audiences": [
+        "api://AzureADTokenExchange"
+    ]
+  }
+EOF
+  )
+  _debug "Creating Federated Credential for: ${sc_id}"
+  az ad app federated-credential create --id "$SP_ID" --parameters "$parameters"
 
   _debug "Service Connection ID: ${sc_id}"
   sleep 10
@@ -259,7 +444,7 @@ function _create_azdo_svc_connection() {
   _debug_json "$_payload"
 
   _uri=$(_set_api_version "${AZDO_ORG_URI}/${AZDO_PROJECT_NAME}/_apis/serviceendpoint/endpoints?api-version=" '5.1-preview.1' '5.1-preview.1')
-  local _token=$(echo -n ":${AZDO_PAT}" | base64)
+  local _token=$(echo -n ":${AZDO_PAT}" | base64 -w 0)
 
   _response=$(
     request_post \
@@ -299,6 +484,34 @@ function _create_azdo_svc_connection() {
   if [ "$_allPipelinesAuthorized" == true ]; then
     _success "azdo service connection authorized for all pipelines"
   fi
+}
+
+function _create_variable_group {
+
+  _information "Create Variable Group"
+
+  local _template_file="$SCRIPT_DIR/templates/variable-group-create.json"
+  local _name="${1}"
+  local _variables=${2}
+
+  local _payload=$(
+    sed <"${_template_file}" 's~__ADO_VARIABLE_GROUP_NAME__~'"${_name}"'~' |
+    sed 's~__ADO_VARIABLES__~'"${_variables}"'~' |
+    sed 's~__ADO_PROJECT_ID__~'"${AZDO_PROJECT_ID}"'~' |
+    sed 's~__ADO_PROJECT_NAME__~'"${AZDO_PROJECT_NAME}"'~'
+  )
+
+  local _uri=$(_set_api_version "${AZDO_ORG_URI}/_apis/distributedtask/variablegroups?api-version=" '7.1' '7.1')
+
+  local _token=$(echo -n ":${AZDO_PAT}" | base64 -w 0)
+  local _response=$(request_post "${_uri}" "${_payload}" "application/json; charset=utf-8" "Basic ${_token}")
+
+  echo "$_payload" >"$AZDO_TEMP_LOG_PATH/${_name}-cvg-payload.json"
+  echo "$_response" >"$AZDO_TEMP_LOG_PATH/${_name}-cvg.json"
+
+  _debug_log_post "$_uri" "$_response" "$_payload"
+
+  _success "Created Variable Group ${_name}"
 }
 
 function _create_pipeline {
@@ -345,7 +558,7 @@ function _create_pipeline {
       sed 's~__ADO_POOL_NAME__~'"${_agent_pool_queue_name}"'~' |
       sed 's~__AZDO_ORG_URI__~'"${AZDO_ORG_URI}"'~'
   )
-  local _token=$(echo -n ":${AZDO_PAT}" | base64)
+  local _token=$(echo -n ":${AZDO_PAT}" | base64 -w 0)
   local _response=$(request_post "${_uri}" "${_payload}" "application/json; charset=utf-8" "Basic ${_token}")
 
   echo "$_payload" >"$AZDO_TEMP_LOG_PATH/${_name}-cp-payload.json"
@@ -394,23 +607,38 @@ function _create_pipeline {
 function _create_svc_connection_payload() {
   local _payload
 
-  local AZDO_SC_AZURERM_NAME='Symphony-KV'
+  local AZDO_SC_AZURERM_NAME='symphony'
 
   if [ "$INSTALL_TYPE" == "PAAS" ]; then
-    _template="$SCRIPT_DIR/templates/service-connection-create-paas.json"
-    _payload=$(
-      cat "$_template" |
-        sed 's~__SERVICE_PRINCIPAL_ID__~'"${SP_ID}"'~' |
-        sed 's@__SERVICE_PRINCIPAL_KEY__@'"${SP_SECRET}"'@' |
-        sed 's~__SERVICE_PRINCIPAL_TENANT_ID__~'"${SP_TENANT_ID}"'~' |
-        sed 's~__CLOUD_ENVIRONMENT__~'"${SP_CLOUD_ENVIRONMENT}"'~' |
-        sed 's~__SUBSCRIPTION_ID__~'"${SP_SUBSCRIPTION_ID}"'~' |
-        sed 's~__SUBSCRIPTION_NAME__~'"${SP_SUBSCRIPTION_NAME}"'~' |
-        sed 's~__SERVICE_CONNECTION_NAME__~'"${AZDO_SC_AZURERM_NAME}"'~' |
-        sed 's~__PROJECT_ID__~'"${AZDO_PROJECT_ID}"'~' |
-        sed 's~__PROJECT_NAME__~'"${AZDO_PROJECT_NAME}"'~' |
-        sed 's~__MANAGEMENT_URI__~'"${MANAGEMENT_URI}"'~'
-    )
+    if [ "$USER_SECRET" == "true" ]; then
+      _template="$SCRIPT_DIR/templates/service-connection-create-paas.json"
+      _payload=$(
+        cat "$_template" |
+          sed 's~__SERVICE_PRINCIPAL_ID__~'"${SP_ID}"'~' |
+          sed 's@__SERVICE_PRINCIPAL_KEY__@'"${SP_SECRET}"'@' |
+          sed 's~__SERVICE_PRINCIPAL_TENANT_ID__~'"${SP_TENANT_ID}"'~' |
+          sed 's~__CLOUD_ENVIRONMENT__~'"${SP_CLOUD_ENVIRONMENT}"'~' |
+          sed 's~__SUBSCRIPTION_ID__~'"${SP_SUBSCRIPTION_ID}"'~' |
+          sed 's~__SUBSCRIPTION_NAME__~'"${SP_SUBSCRIPTION_NAME}"'~' |
+          sed 's~__SERVICE_CONNECTION_NAME__~'"${AZDO_SC_AZURERM_NAME}"'~' |
+          sed 's~__PROJECT_ID__~'"${AZDO_PROJECT_ID}"'~' |
+          sed 's~__PROJECT_NAME__~'"${AZDO_PROJECT_NAME}"'~' |
+          sed 's~__MANAGEMENT_URI__~'"${MANAGEMENT_URI}"'~'
+      )
+    else
+      _template="$SCRIPT_DIR/templates/sc-ado-paas-federated.json"
+      _payload=$(
+        cat "$_template" |
+          sed 's~__SERVICE_PRINCIPAL_ID__~'"${SP_ID}"'~' |
+          sed 's~__SERVICE_PRINCIPAL_TENANT_ID__~'"${SP_TENANT_ID}"'~' |
+          sed 's~__SUBSCRIPTION_ID__~'"${SP_SUBSCRIPTION_ID}"'~' |
+          sed 's~__SUBSCRIPTION_NAME__~'"${SP_SUBSCRIPTION_NAME}"'~' |
+          sed 's~__SERVICE_CONNECTION_NAME__~'"${AZDO_SC_AZURERM_NAME}"'~' |
+          sed 's~__PROJECT_ID__~'"${AZDO_PROJECT_ID}"'~' |
+          #sed 's~__PROJECT_NAME__~'"${AZDO_PROJECT_NAME}"'~' |
+          sed 's~__MANAGEMENT_URI__~'"${MANAGEMENT_URI}"'~'
+      )
+    fi
   else
     _template="$SCRIPT_DIR/templates/service-connection-create-server.json"
     _payload=$(
@@ -458,7 +686,7 @@ function _get_pipeline_var_defintion() {
 }
 function _get_agent_pool_queue() {
   # https://docs.microsoft.com/rest/api/azure/devops/distributedtask/queues/get%20agent%20queues?view=azure-devops-rest-5.1
-  local _token=$(echo -n ":${AZDO_PAT}" | base64)
+  local _token=$(echo -n ":${AZDO_PAT}" | base64 -w 0)
   local _uri="${AZDO_ORG_URI}/${AZDO_PROJECT_NAME}/_apis/distributedtask/queues?api-version=5.1-preview.1"
   _response=$(request_get "$_uri" "application/json; charset=utf-8" "Basic ${_token}")
   _is_ubuntu=$(echo "$_response" | jq '.value[] | select( .name | contains("Ubuntu") )')
@@ -476,7 +704,7 @@ function _get_agent_pool_queue() {
 }
 
 function push_repo {
-  local _token=$(echo -n ":${AZDO_PAT}" | base64)
+  local _token=$(echo -n ":${AZDO_PAT}" | base64 -w 0)
   git -c http.extraHeader="Authorization: Basic ${_token}" push -u origin --all
 }
 

@@ -24,9 +24,7 @@ declare AZDO_TEMP_LOG_PATH="$REPO_DIR/.symphony/logs/$today-azdo"
 declare SYMPHONY_ENV_FILE_PATH="$REPO_DIR/.symphony/symphony.json"
 declare SP_CLOUD_ENVIRONMENT=""
 declare SP_SUBSCRIPTION_NAME="Azure"
-declare SYMPHONY_KV_NAME=""
 declare SYMPHONY_RG_NAME=""
-declare SYMPHONY_ACR_NAME=""
 declare SYMPHONY_SA_STATE_NAME=""
 declare AZURE_REGIONS=""
 
@@ -64,12 +62,6 @@ verify_az_logged_in() {
 
 set_cloud_env() {
   SP_CLOUD_ENVIRONMENT=$(az cloud show | jq -r '.name')
-}
-
-get_acr_login_endpoint() {
-  login_endpoint=$(az cloud show | jq -r '.suffixes.acrLoginServerEndpoint')
-
-  echo "${login_endpoint}"
 }
 
 # Provision resources and service principals needed by Symphony
@@ -122,11 +114,29 @@ configure_orchestrator() {
 
   pushd "$TARGET_ROOT" || exit
   rm -rf .git
-  #Load the reader sp credentials
+  #Load the sp credentials
   loadServicePrincipalCredentials
   load_symphony_env
   printEnvironment
   load_inputs
+
+  local create_private_runners=""
+  _select_yes_no create_private_runners "Create private runners:"
+  if [[ "$create_private_runners" == "yes" ]]; then
+    RUNNERS_RESOURCE_GROUP=""
+    RUNNERS_LOCATION=""
+    RUNNERS_SUBNET=""
+    RUNNERS_COUNT=""
+    RUNNERS_PUBLIC_KEY_PATH=""
+
+    AZURE_REGIONS=$(az account list-locations -o json | jq -r '.[].name' | sort)
+
+    _prompt_input "Enter the name of an existing resource group to deploy the runners to" RUNNERS_RESOURCE_GROUP
+    _select_list_no_display RUNNERS_LOCATION "Enter an Azure Location to deploy the runners to (enter 'list' to view all available locations)" "$AZURE_REGIONS" "location"
+    _prompt_input "Enter the full resource id of an existing subnet to deploy the runners to" RUNNERS_SUBNET
+    _prompt_input "Enter the path to the public key to use for the runners" RUNNERS_PUBLIC_KEY_PATH
+    _select_number RUNNERS_COUNT "Number of runners to create"
+  fi
 
   # remove unused files
   remove_yaml
@@ -137,10 +147,21 @@ configure_orchestrator() {
     remove_tmp_terraform
   fi
 
+  local include_sample_code=""
+  _select_yes_no include_sample_code "Include sample code:"
+
+  if [[ "$include_sample_code" == "no" ]]; then
+    delete_sample_code "$IACTOOL"
+  fi
+
   configure_repo
   configure_credentials
 
-  # Update the resource names KV, ACR, RG
+  if [[ "$create_private_runners" == "yes" ]]; then
+    configure_runners
+  fi
+
+  # Update the resource names
   git add .
   git commit -m "Initial commit"
 
@@ -152,19 +173,14 @@ configure_orchestrator() {
   if [[ $is_mac == 0 ]]; then
     sedCommand="sed -i '' -e "
   fi
-  eval "git grep -l 'kv-symphony-environments' | xargs $sedCommand \"s/kv-symphony-environments/${SYMPHONY_KV_NAME}/g\""
-  eval "git grep -l 'devops-symphony-362' | xargs $sedCommand \"s/devops-symphony-362/${SYMPHONY_RG_NAME}/g\""
+  eval "git grep -l 'rg-lwiuyyav-162' | xargs $sedCommand \"s/rg-lwiuyyav-162/${SYMPHONY_RG_NAME}/g\""
   eval "git grep -l 'AzureCloud' -- ':!*_helpers.sh' | xargs $sedCommand \"s/AzureCloud/$SP_CLOUD_ENVIRONMENT/g\""
-
-  server_endpoint="$(get_acr_login_endpoint)"
-  eval "git grep -l 'crsymphony360.azurecr.io' | xargs $sedCommand \"s/crsymphony360.azurecr.io/${SYMPHONY_ACR_NAME}${server_endpoint}/g\""
-  eval "git grep -l 'crsymphony360' | xargs $sedCommand \"s/crsymphony360/${SYMPHONY_ACR_NAME}/g\""
 
   if [ "$IACTOOL" == "bicep" ]; then
     create_pipelines_bicep
   else
     # Update SA state Name
-    eval "git grep -l 'symphonyremotestate360' | xargs $sedCommand \"s/symphonyremotestate360/${SYMPHONY_SA_STATE_NAME}/g\""
+    eval "git grep -l 'salwiuyyav162' | xargs $sedCommand \"s/salwiuyyav162/${SYMPHONY_SA_STATE_NAME}/g\""
     create_pipelines_terraform
   fi
 

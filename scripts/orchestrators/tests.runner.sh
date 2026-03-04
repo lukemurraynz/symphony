@@ -14,8 +14,7 @@ Usage: ${0} [terraform or bicep]
   bicep             : run \`all\` bicep tests
     bicep arm_ttk   : run \`arm_ttk\`   bicep tests
     bicep pester    : run \`pester\`    bicep tests
-      [optional] provide the name of the test file to run, e.g. source ${0} && bicep pester SqlIntegration.Tests.ps1
-    bicep shellspec : run \`shellspec\` bicep tests
+      [optional] provide the name of the test file to run, e.g. source ${0} && bicep pester End_To_End.Tests.ps1
 
 EOF
 }
@@ -76,21 +75,14 @@ terraform() {
 }
 
 # @description: run tests for bicep
-# @param ${1}: test type, options; arm-ttk, pester, shellspec
+# @param ${1}: test type, options; arm-ttk, pester
 # @param ${2}: test file name
 # @usage <to run all the tests>: source ${0} && bicep
 # @usage <to run all the tests for arm-ttk>: source ${0} && bicep arm-ttk
 # @usage <to run all the tests for pester>: source ${0} && bicep pester
-# @usage <to run {FILENAME} tests only for pester>; source ${0} && bicep pester SqlIntegration.Tests.ps1
-# @usage <to run all the tests for shellspec>: source ${0} && bicep shellspec
+# @usage <to run {FILENAME} tests only for pester>; source ${0} && bicep pester End_To_End.Tests.ps1
 bicep() {
   source ./iac.bicep.sh
-
-  # Set environment variables for BenchPress login
-  export AZ_SUBSCRIPTION_ID="${ARM_SUBSCRIPTION_ID}"
-  export AZ_TENANT_ID="${ARM_TENANT_ID}"
-  export AZ_APPLICATION_ID="${ARM_CLIENT_ID}"
-  export AZ_ENCRYPTED_PASSWORD=$(pwsh -Command "\"${ARM_CLIENT_SECRET}\" | ConvertTo-SecureString -AsPlainText -Force | ConvertFrom-SecureString")
 
   pester() {
     _information "run end to end tests"
@@ -98,24 +90,26 @@ bicep() {
     pushd ./end_to_end
     # if the test file is not specified, run for all files
     if [ -z "${1}" ]; then
-      pwsh -Command "Invoke-Pester -OutputFile test.xml -OutputFormat NUnitXML -EnableExit"
+      pwsh -Command "\$config = New-PesterConfiguration; \
+      \$config.Run.Path = '.'; \
+      \$config.Output.Verbosity = 'Detailed'; \
+      \$config.TestResult.Enabled = \$true; \
+      \$config.TestResult.OutputPath = 'test.xml'; \
+      \$config.TestResult.OutputFormat = 'NUnitXml'; \
+      Invoke-Pester -Configuration \$config"
     else
       TEST_FILE=$(find ${1})
 
       if [ ! -z "${TEST_FILE}" ]; then
-        pwsh -Command "Invoke-Pester -OutputFile test.xml -OutputFormat NUnitXML ${TEST_FILE} -EnableExit"
+        pwsh -Command "\$config = New-PesterConfiguration; \
+        \$config.Run.Path = '${TEST_FILE}'; \
+        \$config.Output.Verbosity = 'Detailed'; \
+        \$config.TestResult.Enabled = \$true; \
+        \$config.TestResult.OutputPath = 'test.xml'; \
+        \$config.TestResult.OutputFormat = 'NUnitXml'; \
+        Invoke-Pester -Configuration \$config"
       fi
     fi
-
-    # return to the previous directory
-    popd
-  }
-
-  shellspec() {
-    _information "run shellspec tests"
-    pushd ./spec
-
-    shellspec -f d
 
     # return to the previous directory
     popd
@@ -126,11 +120,8 @@ bicep() {
 
   if [ -z "${1}" ]; then
     pester "$@"
-    shellspec "$@"
   elif [ "${1}" == "pester" ]; then
     pester ${2}
-  elif [ "${1}" == "shellspec" ]; then
-    shellspec ${2}
   fi
 
   popd

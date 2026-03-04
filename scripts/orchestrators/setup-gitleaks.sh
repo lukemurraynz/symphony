@@ -13,7 +13,7 @@ source _helpers.sh
 source _setup_helpers.sh
 
 set -e
-VERSION="${1:-"latest"}"
+VERSION="${1:-"8.21.2"}"
 
 # Get OS architecture
 get_os_architecture "x64" "arm64" "armv7" "x32"
@@ -27,4 +27,4 @@ filename="gitleaks_${VERSION}_linux_${os_architecture}.tar.gz"
 curl -sSL -o "${filename}" "https://github.com/gitleaks/gitleaks/releases/download/v${VERSION}/${filename}"
 tar -xf "${filename}" gitleaks
 rm -f "${filename}"
-mv -f gitleaks /usr/local/bin/
+sudo mv -f gitleaks /usr/local/bin/
